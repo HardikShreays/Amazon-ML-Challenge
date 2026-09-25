@@ -1,0 +1,19 @@
+# raw data is 2.3 GB and provided by the organisers - never commit it
+student_resource/dataset/
+
+# generated artefacts (parquet, models, candidate/feature shards, submissions)
+work/
+output/
+smoke/
+*.parquet
+
+# environment
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+
+# organiser material (problem statement) - kept local, not published
+*.pdf
+student_resource/README.md
