@@ -1,0 +1,16 @@
+# Python 3.13 (tested on macOS arm64, 8 GB RAM). All MIT / BSD / Apache-2.0 licensed.
+pandas==3.0.6
+numpy==2.5.3
+pyarrow==25.0.1
+scipy==1.18.1
+scikit-learn==1.9.1
+lightgbm==4.7.0
+rapidfuzz==3.14.6
+jellyfish==1.2.1
+hnswlib==0.8.0
+
+# only needed to (re)run notebooks/01_eda.ipynb
+matplotlib==3.11.2
+nbformat==5.11.1
+nbconvert==7.17.1
+ipykernel==7.3.0
