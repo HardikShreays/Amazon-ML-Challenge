@@ -41,14 +41,15 @@ def mine_abbreviations(addr_pairs, min_count):
         t2 = [t for t in b.split() if t.isalpha()]
         s1, s2 = set(t1), set(t2)
         u1, u2 = s1 - s2, s2 - s1
-        longs1 = u1 | {x + y for x, y in zip(t1, t1[1:])}
-        longs2 = u2 | {x + y for x, y in zip(t2, t2[1:])}
+        # joined bigrams only from unmatched tokens: 'north carolina' can explain 'nc', 'nagel circle' can't
+        longs1 = u1 | {x + y for x, y in zip(t1, t1[1:]) if x in u1 and y in u1}
+        longs2 = u2 | {x + y for x, y in zip(t2, t2[1:]) if x in u2 and y in u2}
         for shorts, longs in ((u1, longs2), (u2, longs1)):
             for s in shorts:
                 if 2 <= len(s) <= 4:
                     totals[s] += 1
                     for lg in longs:
-                        if len(lg) >= len(s) + 2 and lg not in s1 & s2 and _is_subseq(s, lg):
+                        if len(lg) >= len(s) + 2 and _is_subseq(s, lg):
                             counts[(s, lg)] += 1
     return _dominant(counts, totals, min_count)
 
