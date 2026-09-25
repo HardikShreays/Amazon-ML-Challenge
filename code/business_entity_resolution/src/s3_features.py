@@ -18,7 +18,6 @@ import shutil
 from multiprocessing import Pool
 
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from rapidfuzz import fuzz
@@ -121,9 +120,25 @@ def pair_features(a, b, pool):
     return f
 
 
-def group_rank(group, value):
-    """1-based rank of each row within its group by descending value (ties by position)."""
-    return pd.Series(value).groupby(group).rank(ascending=False, method='first').to_numpy(np.float32)
+def group_stats(group, value):
+    """Per-row statistics of its group, numpy only (tens of millions of rows, no pandas groupby):
+    rank (1-based, by descending value), group max, group sum, group size, #values > 0.5."""
+    order = np.lexsort((-value, group))
+    g, v = group[order], value[order]
+    starts = np.r_[0, np.flatnonzero(g[1:] != g[:-1]) + 1] if len(g) else np.zeros(0, int)
+    sizes = np.diff(np.r_[starts, len(g)])
+    sorted_stats = {
+        'rank': np.arange(len(g)) - np.repeat(starts, sizes) + 1,
+        'max': np.repeat(v[starts], sizes),                      # sorted descending -> first is the max
+        'sum': np.repeat(np.add.reduceat(v, starts) if len(g) else v, sizes),
+        'size': np.repeat(sizes, sizes),
+        'above': np.repeat(np.add.reduceat(v > 0.5, starts) if len(g) else v, sizes),
+    }
+    out = {}
+    for k, sv in sorted_stats.items():
+        out[k] = np.empty(len(g), np.float32)
+        out[k][order] = sv
+    return out
 
 
 def context_features(cand):
@@ -133,27 +148,23 @@ def context_features(cand):
     for j in range(5):
         cand[f'k{j + 1}'] = ((kb >> j) & 1).astype(np.float32)
     cand['n_keys'] = cand[['k1', 'k2', 'k3', 'k4', 'k5']].sum(axis=1).astype(np.float32)
-    cand['pre_rank'] = group_rank(s1, pre)
-    cand['n_cand'] = cand.groupby('s1')['s1'].transform('size').astype(np.float32)
-    cand['pre_margin'] = (cand.groupby('s1')['prescore'].transform('max') - pre).astype(np.float32)
-    cand['pre_rev_rank'] = group_rank(s23, pre)
-    cand['n_comp'] = cand.groupby('s23')['s23'].transform('size').astype(np.float32)
+    by_s1, by_s23 = group_stats(s1, pre), group_stats(s23, pre)
+    cand['pre_rank'], cand['n_cand'] = by_s1['rank'], by_s1['size']
+    cand['pre_margin'] = by_s1['max'] - pre
+    cand['pre_rev_rank'], cand['n_comp'] = by_s23['rank'], by_s23['size']
     return cand
 
 
-def score_context(df, col):
-    """Competition features on a MODEL score (stage-4 second pass): same idea as context_features, plus
-    the partition hint 'is this S1 the best claimant of this satellite?'."""
-    p = df[col].to_numpy()
-    g1, g23 = df.groupby('s1')[col], df.groupby('s23')[col]
-    return pd.DataFrame({
-        f'{col}_rank': group_rank(df['s1'].to_numpy(), p),
-        f'{col}_margin': (g1.transform('max') - p).to_numpy(np.float32),
-        f'{col}_sum': g1.transform('sum').to_numpy(np.float32),               # expected cluster size
-        f'{col}_n_above': pd.Series(p > 0.5).groupby(df['s1'].to_numpy()).transform('sum').to_numpy(np.float32),
-        f'{col}_rev_rank': group_rank(df['s23'].to_numpy(), p),
-        f'{col}_rev_margin': (g23.transform('max') - p).to_numpy(np.float32),
-    }, index=df.index)
+SCORE_CONTEXT = ['p1', 'p1_rank', 'p1_margin', 'p1_sum', 'p1_n_above', 'p1_rev_rank', 'p1_rev_margin']
+
+
+def score_context(s1, s23, p1):
+    """Competition features on the pass-1 MODEL score (stage-4 second pass), as an (n, 7) matrix in
+    SCORE_CONTEXT order. p1_sum is the entity's expected cluster size; p1_rev_* tell the model
+    whether this S1 is the best claimant of the satellite (the partition property, as a feature)."""
+    a, b = group_stats(s1, p1), group_stats(s23, p1)
+    return np.column_stack([p1, a['rank'], a['max'] - p1, a['sum'], a['above'],
+                            b['rank'], b['max'] - p1]).astype(np.float32)
 
 
 def _gather(table, local_rows):
@@ -168,13 +179,16 @@ def build(split):
     feat_dir = out / 'features'
     shutil.rmtree(feat_dir, ignore_errors=True)
     feat_dir.mkdir()
-    cand = context_features(pq.read_table(out / 'candidates.parquet').to_pandas())
+    cand = pq.read_table(out / 'candidates.parquet').to_pandas()
     s1_country = pq.read_table(out / 's1_sig.parquet', columns=['country'])['country'].to_numpy(zero_copy_only=False)
-    cand['country'] = s1_country[cand['s1'].to_numpy()]
+    country_of_pair = s1_country[cand['s1'].to_numpy()]
 
     part = 0
     with Pool(config.N_JOBS, initializer=_init, initargs=(out / 'idf.pkl',)) as pool:
-        for country, cc in cand.groupby('country', sort=True):
+        for country in sorted(set(country_of_pair)):
+            # one country at a time: a satellite only competes with S1s of its own country, so the
+            # context features are complete, and peak memory is bounded by the largest country
+            cc = context_features(cand[country_of_pair == country].reset_index(drop=True))
             t1 = pq.read_table(out / 's1_sig.parquet', columns=SIG, filters=[('country', '=', country)])
             t23 = pq.read_table(out / 's23_sig.parquet', columns=SIG + ['src'], filters=[('country', '=', country)])
             i1, i23 = t1['idx'].to_numpy(), t23['idx'].to_numpy()
@@ -194,6 +208,22 @@ def build(split):
             print(f'[s3] {split}/{country}: features for {len(cc):,} pairs')
 
 
-def load(split, columns=None):
-    """All feature shards of a split as one DataFrame (float32 features)."""
-    return pq.read_table(config.WORK_DIR / split / 'features', columns=columns).to_pandas()
+def shards(split):
+    """Feature shard paths of a split, in write order."""
+    return sorted((config.WORK_DIR / split / 'features').glob('part-*.parquet'))
+
+
+def load_matrix(paths, cols):
+    """(s1, s23, X float32 [n, len(cols)]) from feature shards, preallocated to avoid double copies."""
+    n = sum(pq.ParquetFile(p).metadata.num_rows for p in paths)
+    s1, s23 = np.empty(n, np.int32), np.empty(n, np.int32)
+    x = np.empty((n, len(cols)), np.float32)
+    i = 0
+    for p in paths:
+        t = pq.read_table(p, columns=['s1', 's23'] + cols)
+        m = t.num_rows
+        s1[i:i + m], s23[i:i + m] = t['s1'].to_numpy(), t['s23'].to_numpy()
+        for j, c in enumerate(cols):
+            x[i:i + m, j] = t[c].to_numpy()
+        i += m
+    return s1, s23, x
