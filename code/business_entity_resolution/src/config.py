@@ -59,6 +59,21 @@ MAX_MATCHES = 8                 # 99%+ of training clusters have <= 7 matches
 TAU_GRID = [round(0.05 * i, 2) for i in range(1, 20)]
 
 
+def worker_pool(initializer=None, initargs=()):
+    """N_JOBS worker processes pinned to one BLAS thread. Workers only do Python / rapidfuzz work, and on
+    Windows every spawned numpy commits ~1 GB for its OpenBLAS thread buffers (16 workers ~ 18 GB)."""
+    from multiprocessing import Pool
+    old = os.environ.get('OPENBLAS_NUM_THREADS')
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'           # read by the children at numpy import
+    try:
+        return Pool(N_JOBS, initializer=initializer, initargs=initargs)
+    finally:
+        if old is None:
+            os.environ.pop('OPENBLAS_NUM_THREADS')
+        else:
+            os.environ['OPENBLAS_NUM_THREADS'] = old
+
+
 def split_dir(split):
     """Work folder for one split (train / test), created on demand."""
     d = WORK_DIR / split

@@ -15,7 +15,6 @@ Output: work/<split>/features/part-*.parquet  (s1, s23, <features>)
 """
 import pickle
 import shutil
-from multiprocessing import Pool
 
 import numpy as np
 import pyarrow as pa
@@ -184,7 +183,7 @@ def build(split):
     country_of_pair = s1_country[cand['s1'].to_numpy()]
 
     part = 0
-    with Pool(config.N_JOBS, initializer=_init, initargs=(out / 'idf.pkl',)) as pool:
+    with config.worker_pool(_init, (out / 'idf.pkl',)) as pool:
         for country in sorted(set(country_of_pair)):
             # one country at a time: a satellite only competes with S1s of its own country, so the
             # context features are complete, and peak memory is bounded by the largest country

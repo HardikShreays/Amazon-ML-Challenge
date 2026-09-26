@@ -21,7 +21,6 @@ import math
 import pickle
 import re
 from collections import Counter
-from multiprocessing import Pool
 
 import jellyfish
 import numpy as np
@@ -106,7 +105,7 @@ def build(split):
     """Compute signatures for S1 and S2/S3 of a split and the address IDF table."""
     out = config.split_dir(split)
     abbr, translit, legal = s1_dictionaries.load(split)
-    with Pool(config.N_JOBS, initializer=_init, initargs=(abbr, translit, legal)) as pool:
+    with config.worker_pool(_init, (abbr, translit, legal)) as pool:
         df1, n1 = _write(pool, out / 's1_raw.parquet', out / 's1_sig.parquet', [])
         df2, n2 = _write(pool, out / 's23_raw.parquet', out / 's23_sig.parquet', ['src'])
     df1.update(df2)

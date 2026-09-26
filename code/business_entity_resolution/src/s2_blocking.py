@@ -17,6 +17,8 @@ kept. That bounded set is exactly what the model scores, i.e. it IS candidate_pa
 Output: work/<split>/candidates.parquet  (s1, s23, kbits, prescore, ann_sim)
         work/<split>/entities.npy        S1 indices that were blocked (train: the sampled ones)
 """
+import math
+
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -30,6 +32,12 @@ from .s1_signatures import load_idf
 K1, K2, K3, K4, K5 = 1, 2, 4, 8, 16
 KEY_NAMES = {K1: 'K1 numbers', K2: 'K2 rare words', K3: 'K3 name squash', K4: 'K4 phonetic', K5: 'K5 ANN'}
 COLS = ['idx', 'squash', 'phon', 'addr_tok', 'nums', 'name_c']
+KEY_COLS = ('squash', 'phon', 'addr_tok', 'nums')
+_W = {}   # per-worker IDF table, filled by _init
+
+
+def _init(idf, default):
+    _W.update(idf=idf, default=default)
 
 
 def rare_words(addr_tok, idf, default, k=2):
@@ -60,6 +68,21 @@ def record_keys(frame, idf, default):
             for b, (rows, keys) in out.items()}
 
 
+def _keys_batch(cols):
+    """Worker: record_keys for one slice of KEY_COLS."""
+    return record_keys(dict(zip(KEY_COLS, cols)), _W['idf'], _W['default'])
+
+
+def parallel_keys(pool, frame):
+    """record_keys over all cores: slices are keyed in the workers, then re-offset and joined in order."""
+    n = len(frame['squash'])
+    step = max(1, math.ceil(n / (config.N_JOBS * 4)))
+    starts = range(0, n, step)
+    parts = pool.map(_keys_batch, [tuple(frame[c][i:i + step] for c in KEY_COLS) for i in starts])
+    return {b: (np.concatenate([p[b][0] + i for p, i in zip(parts, starts)]),
+                np.concatenate([p[b][1] for p in parts])) for b in (K1, K2, K3, K4)}
+
+
 class KeyIndex:
     """Satellite keys sorted by hash, so a batch of S1 keys is resolved with two searchsorted calls."""
 
@@ -85,8 +108,8 @@ class KeyIndex:
 class AnnIndex:
     """K5: char-trigram TF-IDF compressed with truncated SVD, searched with HNSW (cosine)."""
 
-    def __init__(self, texts):
-        import hnswlib
+    def __init__(self, texts, pool):
+        import faiss                    # hnswlib has no Windows wheels; faiss HNSW with the same M / ef settings
         from sklearn.decomposition import TruncatedSVD
         from sklearn.feature_extraction.text import TfidfVectorizer
 
@@ -94,25 +117,43 @@ class AnnIndex:
         fit = [texts[i] for i in rng.permutation(len(texts))[:config.SVD_FIT_ROWS]]
         self.vec = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 3), min_df=2, sublinear_tf=True,
                                    dtype=np.float32).fit(fit)
+        if hasattr(self.vec, 'stop_words_'):
+            del self.vec.stop_words_    # every pruned trigram; only bloats the copy shipped to workers
+        self.pool = pool
         x = self.vec.transform(fit)
         dim = max(2, min(config.SVD_DIM, x.shape[1] - 1, x.shape[0] - 1))
         self.svd = TruncatedSVD(dim, random_state=config.SEED).fit(x)
-        self.index = hnswlib.Index('cosine', dim)
-        self.index.init_index(max_elements=len(texts), ef_construction=100, M=16, random_seed=config.SEED)
-        for i in range(0, len(texts), config.CHUNK_ROWS):
-            part = texts[i:i + config.CHUNK_ROWS]
-            self.index.add_items(self.embed(part), np.arange(i, i + len(part)), num_threads=config.N_JOBS)
-        self.index.set_ef(max(64, config.ANN_K * 2))
+        faiss.omp_set_num_threads(config.N_JOBS)
+        self.faiss = faiss
+        self.index = faiss.IndexHNSWFlat(dim, 16, faiss.METRIC_INNER_PRODUCT)   # cosine = IP on unit vectors
+        self.index.hnsw.efConstruction = 100
+        for i in range(0, len(texts), config.CHUNK_ROWS):              # ids are insertion order = row index
+            self.index.add(self.embed(texts[i:i + config.CHUNK_ROWS]))
+        self.index.hnsw.efSearch = max(64, config.ANN_K * 2)
         self.n = len(texts)
 
     def embed(self, texts):
-        return self.svd.transform(self.vec.transform(texts)).astype(np.float32)
+        """TF-IDF + SVD row by row, so slicing across workers gives exactly the single-process result."""
+        step = max(1, math.ceil(len(texts) / config.N_JOBS))
+        parts = self.pool.map(_embed_batch, [(self.vec, self.svd, texts[i:i + step])
+                                             for i in range(0, len(texts), step)])
+        x = np.ascontiguousarray(np.concatenate(parts), dtype=np.float32)
+        self.faiss.normalize_L2(x)
+        return x
 
     def query(self, texts):
         """-> (query row, satellite row, cosine similarity) for the top-ANN_K neighbours of each text."""
         k = min(config.ANN_K, self.n)
-        labels, dist = self.index.knn_query(self.embed(texts), k=k, num_threads=config.N_JOBS)
-        return np.repeat(np.arange(len(texts)), k), labels.ravel().astype(np.int64), 1 - dist.ravel()
+        sim, labels = self.index.search(self.embed(texts), k)
+        q, labels, sim = np.repeat(np.arange(len(texts)), k), labels.ravel().astype(np.int64), sim.ravel()
+        ok = labels >= 0                                                  # faiss pads short result lists with -1
+        return q[ok], labels[ok], sim[ok]
+
+
+def _embed_batch(args):
+    """Worker: TF-IDF -> SVD for one slice of texts."""
+    vec, svd, texts = args
+    return svd.transform(vec.transform(texts)).astype(np.float32)
 
 
 def ann_text(frame):
@@ -149,16 +190,16 @@ def _take(frame, rows):
     return {c: [frame[c][i] for i in rows] for c in ('squash', 'addr_tok', 'nums')}
 
 
-def block_country(s1, s23, idf, default, writer):
+def block_country(s1, s23, pool, writer):
     """Block every S1 row of one country against that country's satellites; append to writer."""
-    index = KeyIndex(record_keys(s23, idf, default))
-    ann = AnnIndex(ann_text(s23)) if len(s23['idx']) > 1 else None
+    index = KeyIndex(parallel_keys(pool, s23))
+    ann = AnnIndex(ann_text(s23), pool) if len(s23['idx']) > 1 else None
     total = 0
     for start in range(0, len(s1['idx']), config.S1_CHUNK):
         sl = slice(start, start + config.S1_CHUNK)
         chunk = {c: s1[c][sl] for c in COLS}
         pa_, pb_, bits_, sims_ = [], [], [], []
-        for bit, (rows, hashes) in record_keys(chunk, idf, default).items():
+        for bit, (rows, hashes) in parallel_keys(pool, chunk).items():
             a, b = index.lookup(bit, rows, hashes)
             pa_.append(a); pb_.append(b); bits_.append(np.full(len(a), bit, np.uint8)); sims_.append(np.zeros(len(a), np.float32))
         if ann is not None:
@@ -197,7 +238,8 @@ def build(split):
 
     schema = pa.schema([('s1', pa.int32()), ('s23', pa.int32()), ('kbits', pa.uint8()),
                         ('prescore', pa.float32()), ('ann_sim', pa.float32())])
-    with pq.ParquetWriter(out / 'candidates.parquet', schema) as writer:
+    with pq.ParquetWriter(out / 'candidates.parquet', schema) as writer, \
+            config.worker_pool(_init, (idf, default)) as pool:
         for country in sorted(s1_meta['country'].unique()):
             s1 = _load(out / 's1_sig.parquet', country)
             sel = keep[s1['idx']]
@@ -205,6 +247,6 @@ def build(split):
             s23 = _load(out / 's23_sig.parquet', country)
             if not len(s1['idx']) or not len(s23['idx']):
                 continue
-            n = block_country(s1, s23, idf, default, writer)
+            n = block_country(s1, s23, pool, writer)
             print(f'[s2] {split}/{country}: {len(s1["idx"]):,} S1 x {len(s23["idx"]):,} S2/S3 -> {n:,} candidates '
                   f'({n / len(s1["idx"]):.1f} per entity)')

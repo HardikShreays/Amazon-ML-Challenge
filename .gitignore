@@ -17,3 +17,6 @@ __pycache__/
 # organiser material (problem statement) - kept local, not published
 *.pdf
 student_resource/README.md
+
+# archives (local downloads / backups, work.zip is ~8 GB)
+*.zip
