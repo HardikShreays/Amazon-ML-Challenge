@@ -1,0 +1,12 @@
+v5 — v4 + name-rarity features (finished 27 Sep ~16:15 IST)  <- RECOMMENDED
+pipeline: work_v5 (train/test are junctions to work_v4: same blocking, candidates and base features)
+          analysis/orchestrate_final.sh + orchestrate_v5b.sh
+new     : 9 name-rarity features: IDF of shared / unmatched core-name tokens, and how many S1s and satellites
+          of the country carry exactly this squashed name (a name-only match on a unique name is near-certain,
+          on a name shared by dozens of S1s it is not)
+model   : XGBoost on the GPU; pass-1 valid AP 0.9984 (v4 0.9975), pass-2 0.9988 (v4 0.9982)
+decision: mode=partition, tau=0.675, tau_noaddr=0.70 (train TUNE, 110k entities: macro F0.5 0.9765; v4 0.9713;
+          v2 0.9575). Near-equal modes (|diff| < 1e-4) now resolve to partition.
+test    : 68,655,650 candidates, 5,733,816 matches (3.31 per S1); France 3.36 per S1 (v4 3.55), US/India ~unchanged
+validator: PASS (incl. --check-ids)
+leaderboard score: <fill in>

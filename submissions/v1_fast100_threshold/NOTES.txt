@@ -1,0 +1,7 @@
+﻿v1 — fast fallback (uploaded to the leaderboard on 26 Sep, ~23:50 IST)
+command : python -m src.fast_submit --trees 100   (from code/business_entity_resolution)
+model   : pass-1 fold models, first 100 trees each, averaged; no pass 2, no calibration
+decision: mode=threshold, tau=0.65 (tuned on train TUNE split: macro F0.5 0.9486)
+suffixes: loose per-split set (French generic nouns stripped - see audit)
+validator: PASS (incl. --check-ids)
+leaderboard score: <fill in>

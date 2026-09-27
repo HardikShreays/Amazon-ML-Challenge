@@ -37,6 +37,7 @@ _SCHWA_BEFORE = set(_CONSONANTS) | {0x01, 0x02, 0x03}   # a consonant followed b
 
 
 def _is_indic(ch):
+    """True for a character in the Unicode Indic blocks (Devanagari .. Sinhala)."""
     return 0x0900 <= ord(ch) < 0x0D80
 
 

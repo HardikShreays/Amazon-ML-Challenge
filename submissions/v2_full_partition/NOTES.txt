@@ -1,0 +1,6 @@
+﻿v2 — full two-pass model (run by hand: python -m src.run_all --split test --from score, finished 27 Sep 03:04)
+model   : pass-1 (2 folds, all trees) -> competition features -> pass 2 -> isotonic calibration
+decision: mode=partition (one owner per satellite), tau=0.65; no address-missing threshold
+          (train TUNE macro F0.5 0.9575)
+suffixes: loose per-split set (French generic nouns still stripped)
+leaderboard score: <fill in>

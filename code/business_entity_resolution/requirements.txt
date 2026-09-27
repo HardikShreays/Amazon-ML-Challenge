@@ -1,16 +1,19 @@
-# Python 3.13 (tested on macOS arm64, 8 GB RAM). All MIT / BSD / Apache-2.0 licensed.
+# Stages 0-7 (+ stage 8a/8c). Python 3.13.15, tested on Windows 11 (Ryzen 7 4800H, 24 GB RAM, RTX 3050 4 GB).
+# All MIT / BSD / Apache-2.0 licensed.
 pandas==3.0.6
 numpy==2.5.3
 pyarrow==25.0.1
 scipy==1.18.1
 scikit-learn==1.9.1
-lightgbm==4.7.0
+xgboost==3.4.1          # Apache-2.0; the Windows/Linux wheels include CUDA (falls back to CPU)
 rapidfuzz==3.14.6
 jellyfish==1.2.1
-faiss-cpu==1.15.1
+faiss-cpu==1.15.1       # HNSW for blocking key K5
 
 # only needed to (re)run notebooks/01_eda.ipynb
 matplotlib==3.11.2
 nbformat==5.11.1
 nbconvert==7.17.1
 ipykernel==7.3.0
+
+# Stage 8b (cross-encoder, needs a CUDA GPU) is in requirements_gpu.txt.

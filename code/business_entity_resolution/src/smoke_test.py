@@ -6,7 +6,7 @@
      train: SMOKE_TRAIN_S1 random S1 entities + all their true matches + random unlinked distractors
      test:  SMOKE_TEST_S1 random S1 rows (France included) + SMOKE_TEST_S23 random S2/S3 rows
 2. runs the unit self-checks, then `run_all --split train` and `run_all --split test` with ER_SMOKE=1
-   (tiny LightGBM, small SVD) and ER_*_DIR pointing into smoke/
+   (tiny XGBoost, small SVD) and ER_*_DIR pointing into smoke/
 3. runs the official validator with --check-ids on the smoke submission
 
 Numbers printed here say nothing about leaderboard quality: the pools are ~1000x smaller than the
@@ -77,6 +77,7 @@ def make_subset(rng):
 
 
 def run(cmd, env):
+    """Run one command from the package folder; raises if it fails."""
     print(f'[smoke] $ {" ".join(cmd)}')
     t0 = time.time()
     subprocess.run(cmd, cwd=PKG_DIR, env=env, check=True)
@@ -84,6 +85,7 @@ def run(cmd, env):
 
 
 def main():
+    """Build the smoke subset, run the self-checks, both splits end to end and the validator."""
     make_subset(np.random.default_rng(config.SEED))
     env = {**os.environ, 'ER_SMOKE': '1', 'ER_DATA_DIR': str(SMOKE_DIR / 'dataset'),
            'ER_WORK_DIR': str(SMOKE_DIR / 'work'), 'ER_OUTPUT_DIR': str(SMOKE_DIR / 'output')}

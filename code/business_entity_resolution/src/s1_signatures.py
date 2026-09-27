@@ -9,7 +9,7 @@ Columns written to work/<split>/{s1,s23}_sig.parquet (one row per raw row, same 
     squash     core name with all spaces removed ('seguraclassicarmour')
     phon       metaphone of the first two core tokens
     addr_tok   canonical alphabetic address tokens after abbreviation folding
-    nums       numeric runs of the address, in order, de-duplicated ('14243 157')
+    nums       numeric runs of the address without leading zeros, in order, de-duplicated ('14243 157')
     is_domain / non_latin / addr_empty   int8 flags
 plus `src` (2/3) for satellites.
 
@@ -35,12 +35,13 @@ _W = {}   # per-worker dictionaries, filled by _init
 
 
 def _init(abbr, translit, legal):
-    _W.update(abbr=abbr, translit=translit, legal=legal, longs=set(abbr.values()))
+    """Worker initialiser: share the abbreviation, transliteration and legal-suffix maps."""
+    _W.update(abbr=abbr, translit=translit, legal=legal, longs=set(abbr['*'].values()))
 
 
-def signature(name, addr):
+def signature(name, addr, country):
     """Signature tuple for one record (see module docstring for the fields)."""
-    tr, legal = _W['translit'], _W['legal']
+    tr, legal = _W['translit'], s1_dictionaries.legal_for(_W['legal'], country)
     toks = [tr.get(t, t) for t in canon(name).split()]
     dom = is_domain(name)
     if dom:
@@ -56,8 +57,9 @@ def signature(name, addr):
             merged.append(atoks[i] + atoks[i + 1]); i += 2
         else:
             merged.append(atoks[i]); i += 1
-    alpha = [_W['abbr'].get(t, t) for t in merged if t.isalpha() and len(t) > 1]
-    nums = list(dict.fromkeys(_NUM.findall(' '.join(merged))))
+    ab = _W['abbr'].get(country, _W['abbr']['*'])            # per-country map (unseen countries: + mined extras)
+    alpha = [ab.get(t, t) for t in merged if t.isalpha() and len(t) > 1]
+    nums = list(dict.fromkeys(n.lstrip('0') or '0' for n in _NUM.findall(' '.join(merged))))   # 0040 == 40
     return (' '.join(toks), ' '.join(core), sfx, ''.join(core), phon, ' '.join(alpha), ' '.join(nums),
             int(dom), int(has_indic(name)), int(not addr.strip()))
 
@@ -66,9 +68,9 @@ SIG_COLS = ['name_c', 'name_core', 'sfx', 'squash', 'phon', 'addr_tok', 'nums', 
 
 
 def _sig_batch(args):
-    """Worker: signatures for a list of (name, addr) + document frequencies of address tokens."""
-    names, addrs = args
-    rows = [signature(n, a) for n, a in zip(names, addrs)]
+    """Worker: signatures for a list of (name, addr, country) + document frequencies of address tokens."""
+    names, addrs, countries = args
+    rows = [signature(n, a, c) for n, a, c in zip(names, addrs, countries)]
     df = Counter()
     for r in rows:
         df.update(set(r[5].split()))
@@ -81,8 +83,10 @@ def _write(pool, raw_path, out_path, extra_cols):
     for batch in pq.ParquetFile(raw_path).iter_batches(batch_size=config.CHUNK_ROWS):
         names = batch.column('business_name').to_pylist()
         addrs = batch.column('business_address').to_pylist()
+        countries = batch.column('country').to_pylist()
         step = max(1, math.ceil(len(names) / (config.N_JOBS * 4)))
-        parts = pool.map(_sig_batch, [(names[i:i + step], addrs[i:i + step]) for i in range(0, len(names), step)])
+        parts = pool.map(_sig_batch, [(names[i:i + step], addrs[i:i + step], countries[i:i + step])
+                                      for i in range(0, len(names), step)])
         rows = [r for p in parts for r in p[0]]
         for p in parts:
             df_total.update(p[1])

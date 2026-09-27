@@ -1,0 +1,14 @@
+v4 — better blocking + full-population training + GPU XGBoost (finished 27 Sep 15:08 IST)
+pipeline: work_v4 (analysis/run_v4.sh, analysis/orchestrate_v4c.sh + orchestrate_final.sh)
+blocking: K1-K5 + K6 (core-name token x house number) + K7 (exact core-name squash);
+          pre-score ranks on the name alone when either address is empty; numbers without leading zeros
+          train pair completeness 0.929 -> 0.972 (US 0.982, India 0.956) at ~40 candidates / S1
+France  : address abbreviations mined WITHOUT labels from near-certain test pairs (av->avenue, bd->boulevard,
+          st->saint, imp->impasse ...); the US/India train map is no longer applied to France
+training: every train S1 blocked (competition features as in test), model fit on 600k entities
+model   : XGBoost on the GPU, 2-fold OOF pass 1 -> competition features -> pass 2 -> isotonic; full model on
+          every test pair (no tree truncation)
+decision: mode=partition, tau=0.65 (train TUNE, 110k entities: macro F0.5 0.9713, ceiling 0.9908)
+test    : 68,655,650 candidates, 5,806,420 matches (3.35 per S1; v3 had 3.08)
+validator: PASS (incl. --check-ids)
+leaderboard score: <fill in>

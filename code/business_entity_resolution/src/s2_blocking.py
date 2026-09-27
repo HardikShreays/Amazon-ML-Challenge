@@ -6,10 +6,16 @@ Keys (all within one country; country is an open set of labels, never hardcoded)
     K3  first 8 chars of the core-name squash (domain names, suffix drift, punctuation)
     K4  metaphone of the first two core-name tokens (typos)
     K5  char-trigram TF-IDF -> truncated SVD -> HNSW cosine top-ANN_K (safety net for everything fuzzy)
+    K6  each of the first 2 core-name tokens x each of the first NUMS_PER_ADDR address numbers
+    K7  the whole core-name squash (K3's 8-char prefix is too generic for common first words:
+        'heritage...' blocks exceed MAX_BLOCK, 'heritagequalityhorse' does not)
 A key value shared by more than MAX_BLOCK satellite rows is too generic and is ignored.
 
 EDA (notebook §8): plain K1-K4 cover 92.2% of true pairs, the refined K1/K3/K4 used here 95.4%;
 K5 targets the rest (non-Latin names with noisy addresses).
+
+K6 + K7 were added after measuring an uncapped union on 8k held-out train entities: they catch ~40%
+of the true pairs no K1-K5 key produced (0.953 union recall).
 
 The union is scored with a cheap, non-learned pre-score and the top MAX_CANDIDATES per entity are
 kept. That bounded set is exactly what the model scores, i.e. it IS candidate_pairs.tsv.
@@ -29,14 +35,17 @@ from rapidfuzz.process import cpdist
 from . import config
 from .s1_signatures import load_idf
 
-K1, K2, K3, K4, K5 = 1, 2, 4, 8, 16
-KEY_NAMES = {K1: 'K1 numbers', K2: 'K2 rare words', K3: 'K3 name squash', K4: 'K4 phonetic', K5: 'K5 ANN'}
-COLS = ['idx', 'squash', 'phon', 'addr_tok', 'nums', 'name_c']
-KEY_COLS = ('squash', 'phon', 'addr_tok', 'nums')
+K1, K2, K3, K4, K5, K6, K7 = 1, 2, 4, 8, 16, 32, 64
+KEY_NAMES = {K1: 'K1 numbers', K2: 'K2 rare words', K3: 'K3 name squash', K4: 'K4 phonetic', K5: 'K5 ANN',
+             K6: 'K6 name token x number', K7: 'K7 full squash'}
+LOOKUP_BITS = (K1, K2, K3, K4, K6, K7)
+COLS = ['idx', 'squash', 'phon', 'addr_tok', 'nums', 'name_c', 'name_core']
+KEY_COLS = ('squash', 'phon', 'addr_tok', 'nums', 'name_core')
 _W = {}   # per-worker IDF table, filled by _init
 
 
 def _init(idf, default):
+    """Worker initialiser: share the address-token IDF table used by the pre-score."""
     _W.update(idf=idf, default=default)
 
 
@@ -46,24 +55,31 @@ def rare_words(addr_tok, idf, default, k=2):
 
 
 def record_keys(frame, idf, default):
-    """Blocking keys K1-K4 for every row of `frame` -> {bit: (row positions, uint64 key hashes)}."""
-    out = {b: ([], []) for b in (K1, K2, K3, K4)}
+    """Blocking keys K1-K4, K6, K7 for every row of `frame` -> {bit: (row positions, uint64 key hashes)}."""
+    out = {b: ([], []) for b in LOOKUP_BITS}
 
     def add(bit, i, key):
+        """Record one (row, key value) emission for blocking key `bit`."""
         out[bit][0].append(i)
         out[bit][1].append(key)
 
-    for i, (sq, ph, at, nm) in enumerate(zip(frame['squash'], frame['phon'], frame['addr_tok'], frame['nums'])):
+    for i, (sq, ph, at, nm, core) in enumerate(zip(frame['squash'], frame['phon'], frame['addr_tok'], frame['nums'],
+                                                   frame['name_core'])):
         r2 = rare_words(at, idf, default)
+        lead = [t for t in core.split()[:2] if len(t) >= 3]
         for n in nm.split()[:config.NUMS_PER_ADDR]:
             for r in r2:
                 add(K1, i, f'{n}|{r[:3]}')
+            for t in lead:
+                add(K6, i, f'{t}#{n}')
         if len(r2) == 2:
             add(K2, i, '|'.join(r2 if r2[0] < r2[1] else r2[::-1]))
         if len(sq) >= 4:
             add(K3, i, sq[:8])
         if ph:
             add(K4, i, ph)
+        if len(sq) >= 6:
+            add(K7, i, '=' + sq)
     return {b: (np.asarray(rows, dtype=np.int64), pd.util.hash_array(np.asarray(keys, dtype=object)))
             for b, (rows, keys) in out.items()}
 
@@ -80,7 +96,7 @@ def parallel_keys(pool, frame):
     starts = range(0, n, step)
     parts = pool.map(_keys_batch, [tuple(frame[c][i:i + step] for c in KEY_COLS) for i in starts])
     return {b: (np.concatenate([p[b][0] + i for p, i in zip(parts, starts)]),
-                np.concatenate([p[b][1] for p in parts])) for b in (K1, K2, K3, K4)}
+                np.concatenate([p[b][1] for p in parts])) for b in LOOKUP_BITS}
 
 
 class KeyIndex:
@@ -162,12 +178,17 @@ def ann_text(frame):
 
 
 def prescore(a, b, kbits):
-    """Cheap non-learned pair score used only to rank/cap candidates (all rapidfuzz C++, threaded)."""
+    """Cheap non-learned pair score used only to rank/cap candidates (all rapidfuzz C++, threaded).
+    A pair where either address is empty is ranked on the name alone: under the name+address blend it
+    could never make the cap (held-out train: recall at 40 candidates 0.926 -> 0.952 with this rule)."""
     name = cpdist(a['squash'], b['squash'], scorer=fuzz.ratio, workers=-1)
     addr = cpdist(a['addr_tok'], b['addr_tok'], scorer=fuzz.token_set_ratio, workers=-1)
     num = cpdist(a['nums'], b['nums'], scorer=fuzz.token_set_ratio, workers=-1)
+    name_set = cpdist(a['name_c'], b['name_c'], scorer=fuzz.token_set_ratio, workers=-1)
+    no_addr = np.fromiter((not x or not y for x, y in zip(a['addr_tok'], b['addr_tok'])), bool, len(name))
     nkeys = np.unpackbits(kbits[:, None], axis=1).sum(axis=1)
-    return (0.35 * name + 0.35 * addr + 0.2 * num) / 100 + 0.02 * nkeys
+    blend = np.where(no_addr, 0.9 * np.maximum(name, name_set), 0.35 * name + 0.35 * addr + 0.2 * num)
+    return blend / 100 + 0.02 * nkeys
 
 
 def top_k_per_group(group, score, k):
@@ -187,7 +208,8 @@ def _load(path, country):
 
 
 def _take(frame, rows):
-    return {c: [frame[c][i] for i in rows] for c in ('squash', 'addr_tok', 'nums')}
+    """The columns the pre-score needs, for the given rows of a signature frame."""
+    return {c: [frame[c][i] for i in rows] for c in ('squash', 'addr_tok', 'nums', 'name_c')}
 
 
 def block_country(s1, s23, pool, writer):

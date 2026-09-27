@@ -34,6 +34,7 @@ def write_id_lists(path, column, s1_ids, s23_ids, s1, s23, chunk=200_000):
 
 
 def build(split='test'):
+    """Write candidate_pairs.tsv (the scored candidate set) and matching_results.tsv (the decided matches) for `split`."""
     out = config.WORK_DIR / split
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     s1_ids = pq.read_table(out / 's1_raw.parquet', columns=['entity_id'])['entity_id'].combine_chunks()
@@ -49,7 +50,7 @@ def build(split='test'):
 
 
 def validate(check_ids=False):
-    """Run student_resource/utils/validate_submission.py; raises if it does not print PASS."""
+    """Run the organisers' validator (vendored as src/validate_submission.py); raises unless it prints PASS."""
     cmd = [sys.executable, str(config.VALIDATOR),
            '--matching', str(config.OUTPUT_DIR / 'matching_results.tsv'),
            '--candidate', str(config.OUTPUT_DIR / 'candidate_pairs.tsv'),

@@ -20,3 +20,15 @@ student_resource/README.md
 
 # archives (local downloads / backups, work.zip is ~8 GB)
 *.zip
+
+# versioned work dirs (tens of GB) and cloud/Kaggle bundles (derived copies of src + parquet)
+work_*/
+ce_bundle/
+kaggle_ds/
+kaggle_kernel/
+*.tar.gz
+*.safetensors
+pkg/
+
+# submission history: keep NOTES.txt / ce_decision.json, not the ~1 GB TSVs
+submissions/**/*.tsv

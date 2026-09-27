@@ -1,0 +1,11 @@
+v6 — v5 + cross-encoder re-scoring of the grey zone (finished 27 Sep 21:20 IST)  <- RECOMMENDED
+pipeline: work_v5 + stage 8 (src/s8_ce_export.py, s8_ce_gpu.py, s8_ce_merge.py)
+grey zone: v5 GBDT p in [0.01, 0.99] = 2.49M of 68.7M test pairs (holds 98% of TUNE false negatives, 94% of false positives)
+model   : intfloat/multilingual-e5-base (MIT, 278M) fine-tuned as a pair classifier on the local RTX 3050, 20 min,
+          233k of 749k pairs (TRAIN positives + hard negatives, CAL grey zone, 120k France pseudo-labels)
+stack   : logistic regression on [logit p_gbdt, logit_ce, address-missing], cross-fitted on TUNE by entity
+          grey-zone accuracy 0.9091 (GBDT) -> 0.9299 (stack)
+decision: partition, tau=0.725, tau_noaddr=0.75 (TUNE macro F0.5 0.9804; v5 0.9765; CE alone 0.9764)
+test    : 5,705,925 matches (3.29 per S1)
+validator: PASS
+leaderboard score: <fill in>

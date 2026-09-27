@@ -23,6 +23,7 @@ def pair_codes(s1, s23):
 
 
 def report(split='train'):
+    """Pair completeness, reduction ratio and per-key / only-this-key recall of the candidates, overall and per country -> blocking_diagnostics.json."""
     out = config.WORK_DIR / split
     cand = pq.read_table(out / 'candidates.parquet', columns=['s1', 's23', 'kbits']).to_pandas()
     entities = np.load(out / 'entities.npy')

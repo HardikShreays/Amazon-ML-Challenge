@@ -13,10 +13,13 @@ C. context   blocking key bits, pre-score, ANN similarity, and competition featu
 
 Output: work/<split>/features/part-*.parquet  (s1, s23, <features>)
 """
+import math
 import pickle
 import shutil
+from collections import Counter
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from rapidfuzz import fuzz
@@ -41,16 +44,22 @@ FUZZY = [
 ]
 PY = ['core_jacc', 'core_contain', 'acronym', 'sfx_compat', 'num_jacc', 'num_contain', 'lead_eq', 'lead_in',
       'num_near', 'addr_jacc', 'idf_cov_a', 'idf_cov_b', 'idf_shared_sum', 'idf_shared_max']
-CONTEXT = ['k1', 'k2', 'k3', 'k4', 'k5', 'n_keys', 'prescore', 'ann_sim', 'pre_rank', 'n_cand', 'pre_margin',
+CONTEXT = ['k1', 'k2', 'k3', 'k4', 'k5', 'k6', 'k7', 'n_keys', 'prescore', 'ann_sim', 'pre_rank', 'n_cand', 'pre_margin',
            'pre_rev_rank', 'n_comp']
 OTHER = ['sq_prefix_frac', 'name_len_diff', 'name_ntok_diff', 'addr_ntok_a', 'addr_ntok_b', 'n_nums_a', 'n_nums_b',
          'b_is_domain', 'b_non_latin', 'b_addr_empty', 'b_src']
-BASE_FEATURES = [f for f, _, _ in FUZZY] + PY + OTHER + CONTEXT
+# D. name rarity (config.NAME_FEATS): a name-only match on a unique name is near-certain, on a name
+#    shared by dozens of S1s it is a coin flip; nothing above says which. IDF over core-name tokens of
+#    the split, plus how many S1s / satellites of the country carry exactly this squashed name.
+NAME = ['nidf_shared_sum', 'nidf_shared_max', 'nidf_cov_a', 'nidf_cov_b', 'nidf_miss_max_a', 'nidf_miss_max_b',
+        'sq_n_s1_a', 'sq_n_s1_b', 'sq_n_s23_b']
+BASE_FEATURES = [f for f, _, _ in FUZZY] + PY + OTHER + CONTEXT + (NAME if config.NAME_FEATS else [])
 
 _W = {}
 
 
 def _init(idf_path):
+    """Worker initialiser: load the address-token IDF table once per process."""
     with open(idf_path, 'rb') as f:
         d = pickle.load(f)
     _W.update(idf=d['idf'], default=d['default'])
@@ -92,7 +101,62 @@ def _py_batch(args):
 
 
 def _ntok(values):
+    """Number of whitespace tokens of each string, as float32."""
     return np.fromiter((len(v.split()) for v in values), np.float32, len(values))
+
+
+def name_stats(split):
+    """Name-token IDF over S1 + S2/S3 core names of the split, and exact squash counts per country
+    for S1 and for satellites (unsupervised; cached in work/<split>/name_stats.pkl)."""
+    path = config.WORK_DIR / split / 'name_stats.pkl'
+    if path.exists():
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    df, n, sq = Counter(), 0, {}
+    for side, name in (('s1', 's1_sig.parquet'), ('s23', 's23_sig.parquet')):
+        t = pq.read_table(config.WORK_DIR / split / name, columns=['name_core', 'squash', 'country'])
+        for core in t['name_core'].to_pylist():
+            df.update(set(core.split()))
+        n += t.num_rows
+        keys, counts = np.unique(_name_keys(t['country'].to_pylist(), t['squash'].to_pylist()), return_counts=True)
+        sq[side] = (keys, counts)                               # sorted hashes of (country, squash) -> count
+        del t
+    stats = {'idf': {k: math.log(n / (1 + v)) for k, v in df.items()}, 'default': math.log(n), **sq}
+    with open(path, 'wb') as f:
+        pickle.dump(stats, f)
+    return stats
+
+
+def _name_keys(countries, squashes):
+    """int64 hash of (country, squashed name), used to count how many records share an exact name."""
+    return pd.util.hash_array(np.asarray([f'{c}|{q}' for c, q in zip(countries, squashes)], dtype=object))
+
+
+def _count(table, keys):
+    """How many records carry each key (0 when absent), from a (sorted keys, counts) pair."""
+    k, c = table
+    pos = np.minimum(np.searchsorted(k, keys), len(k) - 1)
+    return np.where(k[pos] == keys, c[pos], 0)
+
+
+def name_features(a, b, stats, country):
+    """Group-D features (see NAME) for aligned S1 (a) / satellite (b) signature lists."""
+    idf, default = stats['idf'], stats['default']
+    n = len(a['name_core'])
+    ka, kb = _name_keys([country] * n, a['squash']), _name_keys([country] * n, b['squash'])
+    out = np.zeros((n, len(NAME)), np.float32)
+    out[:, 6] = np.log1p(_count(stats['s1'], ka))
+    out[:, 7] = np.log1p(_count(stats['s1'], kb))
+    out[:, 8] = np.log1p(_count(stats['s23'], kb))
+    for i, (ca, cb) in enumerate(zip(a['name_core'], b['name_core'])):
+        ta, tb = set(ca.split()), set(cb.split())
+        wa = {t: idf.get(t, default) for t in ta}
+        wb = {t: idf.get(t, default) for t in tb}
+        shared = [wa[t] for t in ta & tb]
+        out[i, :6] = (sum(shared), max(shared, default=0.0), sum(shared) / (sum(wa.values()) or 1.0),
+                      sum(shared) / (sum(wb.values()) or 1.0), max((w for t, w in wa.items() if t not in tb), default=0.0),
+                      max((w for t, w in wb.items() if t not in ta), default=0.0))
+    return {name: out[:, j] for j, name in enumerate(NAME)}
 
 
 def pair_features(a, b, pool):
@@ -144,9 +208,9 @@ def context_features(cand):
     """Group-C features from the pre-score: how does this pair compare with its competitors?"""
     s1, s23, pre = cand['s1'].to_numpy(), cand['s23'].to_numpy(), cand['prescore'].to_numpy()
     kb = cand['kbits'].to_numpy()
-    for j in range(5):
+    for j in range(7):
         cand[f'k{j + 1}'] = ((kb >> j) & 1).astype(np.float32)
-    cand['n_keys'] = cand[['k1', 'k2', 'k3', 'k4', 'k5']].sum(axis=1).astype(np.float32)
+    cand['n_keys'] = cand[[f'k{j + 1}' for j in range(7)]].sum(axis=1).astype(np.float32)
     by_s1, by_s23 = group_stats(s1, pre), group_stats(s23, pre)
     cand['pre_rank'], cand['n_cand'] = by_s1['rank'], by_s1['size']
     cand['pre_margin'] = by_s1['max'] - pre
@@ -172,22 +236,34 @@ def _gather(table, local_rows):
     return {c: t[c].to_pylist() for c in SIG if c != 'idx'}
 
 
-def build(split):
-    """Compute features for all candidate pairs of a split, one parquet shard per chunk."""
+def build(split, resume=False):
+    """Compute features for all candidate pairs of a split, one parquet shard per chunk.
+    resume=True keeps the shards already written and skips every country whose shards all exist."""
     out = config.split_dir(split)
     feat_dir = out / 'features'
-    shutil.rmtree(feat_dir, ignore_errors=True)
-    feat_dir.mkdir()
-    cand = pq.read_table(out / 'candidates.parquet').to_pandas()
-    s1_country = pq.read_table(out / 's1_sig.parquet', columns=['country'])['country'].to_numpy(zero_copy_only=False)
-    country_of_pair = s1_country[cand['s1'].to_numpy()]
+    if not resume:
+        shutil.rmtree(feat_dir, ignore_errors=True)
+    feat_dir.mkdir(exist_ok=True)
+    cand = pq.read_table(out / 'candidates.parquet')           # stays in Arrow; one country at a time goes to pandas
+    names, codes = np.unique(pq.read_table(out / 's1_sig.parquet', columns=['country'])['country']
+                             .to_numpy(zero_copy_only=False), return_inverse=True)
+    country_of_pair = codes.astype(np.int16)[cand['s1'].to_numpy()]
 
+    stats = name_stats(split) if config.NAME_FEATS else None
     part = 0
-    with config.worker_pool(_init, (out / 'idf.pkl',)) as pool:
-        for country in sorted(set(country_of_pair)):
-            # one country at a time: a satellite only competes with S1s of its own country, so the
-            # context features are complete, and peak memory is bounded by the largest country
-            cc = context_features(cand[country_of_pair == country].reset_index(drop=True))
+    for code, country in enumerate(names):
+        sel = country_of_pair == code
+        n_parts = -(-int(sel.sum()) // config.FEATURE_CHUNK)
+        if resume and all((feat_dir / f'part-{p:04d}.parquet').exists() for p in range(part, part + n_parts)):
+            print(f'[s3] {split}/{country}: {n_parts} shards already written, skipping')
+            part += n_parts
+            continue
+        # one country at a time: a satellite only competes with S1s of its own country, so the
+        # context features are complete, and peak memory is bounded by the largest country. The
+        # worker pool only exists while pair features are computed (each worker holds the IDF table).
+        cc = context_features(cand.filter(pa.array(sel)).to_pandas())
+        del sel
+        with config.worker_pool(_init, (out / 'idf.pkl',)) as pool:
             t1 = pq.read_table(out / 's1_sig.parquet', columns=SIG, filters=[('country', '=', country)])
             t23 = pq.read_table(out / 's23_sig.parquet', columns=SIG + ['src'], filters=[('country', '=', country)])
             i1, i23 = t1['idx'].to_numpy(), t23['idx'].to_numpy()
@@ -197,6 +273,8 @@ def build(split):
                 a = _gather(t1, np.searchsorted(i1, ch['s1'].to_numpy()))
                 b = _gather(t23, r23)
                 f = pair_features(a, b, pool)
+                if stats is not None:
+                    f.update(name_features(a, b, stats, country))
                 f['b_src'] = t23['src'].take(pa.array(r23)).to_numpy().astype(np.float32)
                 for c in CONTEXT:
                     f[c] = ch[c].to_numpy(np.float32)
@@ -205,6 +283,34 @@ def build(split):
                 pq.write_table(table, feat_dir / f'part-{part:04d}.parquet')
                 part += 1
             print(f'[s3] {split}/{country}: features for {len(cc):,} pairs')
+        del cc
+
+
+def augment(split):
+    """Append the group-D (NAME) columns to feature shards written without them, in place. Needs no
+    worker pool and no fuzzy matching, so it costs minutes instead of a full feature pass."""
+    stats = name_stats(split)
+    w = config.WORK_DIR / split
+    sig = {side: pq.read_table(w / name, columns=['idx', 'name_core', 'squash', 'country'])
+           for side, name in (('s1', 's1_sig.parquet'), ('s23', 's23_sig.parquet'))}
+    for path in shards(split):
+        t = pq.read_table(path)
+        if all(c in t.column_names for c in NAME):
+            continue
+        a = sig['s1'].take(t['s1'])                      # sig row == record index (idx is 0..n-1 in order)
+        b = sig['s23'].take(t['s23'])
+        f = {n: np.zeros(t.num_rows, np.float32) for n in NAME}
+        countries = a['country'].to_numpy(zero_copy_only=False)
+        for country in np.unique(countries):
+            rows = np.flatnonzero(countries == country)
+            fa = {c: a[c].take(pa.array(rows)).to_pylist() for c in ('name_core', 'squash')}
+            fb = {c: b[c].take(pa.array(rows)).to_pylist() for c in ('name_core', 'squash')}
+            for n, v in name_features(fa, fb, stats, country).items():
+                f[n][rows] = v
+        for n in NAME:
+            t = t.append_column(n, pa.array(f[n]))
+        pq.write_table(t, path)
+    print(f'[s3] {split}: name-rarity columns present in all shards')
 
 
 def shards(split):
@@ -212,14 +318,27 @@ def shards(split):
     return sorted((config.WORK_DIR / split / 'features').glob('part-*.parquet'))
 
 
-def load_matrix(paths, cols):
-    """(s1, s23, X float32 [n, len(cols)]) from feature shards, preallocated to avoid double copies."""
-    n = sum(pq.ParquetFile(p).metadata.num_rows for p in paths)
+def column(paths, col):
+    """One column over all shards, concatenated in shard order."""
+    return np.concatenate([pq.read_table(p, columns=[col])[col].to_numpy() for p in paths])
+
+
+def load_matrix(paths, cols, mask=None, extra=0):
+    """(s1, s23, X float32 [n, len(cols) + extra]) from feature shards, preallocated to avoid double
+    copies; the `extra` trailing columns are left for the caller to fill. `mask` (bool, aligned with the
+    rows of `paths` in shard order) loads only those rows, so a sample of a split whose full matrix would
+    not fit in RAM can still be read."""
+    sizes = [pq.ParquetFile(p).metadata.num_rows for p in paths]
+    bounds = np.r_[0, np.cumsum(sizes)]
+    rows = [None if mask is None else np.flatnonzero(mask[bounds[k]:bounds[k + 1]]) for k in range(len(paths))]
+    n = sum(s if r is None else len(r) for s, r in zip(sizes, rows))
     s1, s23 = np.empty(n, np.int32), np.empty(n, np.int32)
-    x = np.empty((n, len(cols)), np.float32)
+    x = np.empty((n, len(cols) + extra), np.float32)
     i = 0
-    for p in paths:
+    for p, r in zip(paths, rows):
         t = pq.read_table(p, columns=['s1', 's23'] + cols)
+        if r is not None:
+            t = t.take(pa.array(r))
         m = t.num_rows
         s1[i:i + m], s23[i:i + m] = t['s1'].to_numpy(), t['s23'].to_numpy()
         for j, c in enumerate(cols):

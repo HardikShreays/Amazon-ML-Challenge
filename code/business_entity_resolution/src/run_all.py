@@ -40,6 +40,7 @@ def stages(split):
 
 
 def main():
+    """CLI: run the stages of one split in order, skipping those whose checkpoint exists."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--split', choices=['train', 'test'], required=True)
     ap.add_argument('--from', dest='start', help='re-run from this stage onwards')

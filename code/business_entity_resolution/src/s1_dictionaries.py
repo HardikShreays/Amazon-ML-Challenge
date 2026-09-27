@@ -5,17 +5,29 @@
    partner's address: dr→drive, rd→road, mh→maharashtra, nc→northcarolina.
 2. transliteration map (name + address tokens) — from TRAIN ground-truth pairs whose satellite side
    is in an Indic script: romanised token → best fuzzy Latin token of the partner: praivet→private.
-3. legal / generic suffix set — per split, from S1 names only (no labels): trailing tokens and
-   trailing bigrams used by >= LEGAL_MIN_SHARE of a country's S1 names. This is how the unseen
-   French sarl / sas / eurl / sci are picked up on the test split.
+3. legal / generic suffix set, per country — from S1 names only (no labels): trailing tokens and
+   trailing bigrams used by >= LEGAL_MIN_SHARE of a country's S1 names. Countries seen in train
+   keep exactly the train set, so the model sees the features it was trained on. A country absent
+   from train (France) gets the strict rule in mine_legal_strict: the loose rule also stripped its
+   generic nouns (club, centre, ecole...), which collapsed sibling businesses such as 'Lille Club'
+   and 'Lille Amicale' onto one core name (test audit: 78 multi-owner satellites per 1k S1s).
 
-Outputs: work/train/maps.json (1+2), work/<split>/legal.json (3).
+4. abbreviation map for a country absent from train (France) — mined WITHOUT labels from the split
+   itself: S1/satellite pairs with an identical squashed name (>= 8 chars, unique among the
+   country's S1s) and the same first address number are near-certain matches and stand in for the
+   ground truth of (1): av→avenue, bd→boulevard, st→saint, imp→impasse, rte→route ... Joined-bigram
+   artefacts ('rd'→'rued') are dropped by requiring the long form to be a real address token of
+   that country. Countries seen in train keep exactly the train map.
+
+Outputs: work/train/maps.json (1+2), work/<split>/legal.json (3, {country: [tokens]}),
+         work/<split>/abbr_extra.json (4, {country: {short: long}}; test only).
 """
 import json
 import re
 from collections import Counter, defaultdict
 
 import numpy as np
+import pandas as pd
 import pyarrow.parquet as pq
 from rapidfuzz import fuzz, process
 
@@ -23,6 +35,7 @@ from . import config
 from .s1_normalise import canon, has_indic
 
 _INDIC_RUN = re.compile(r'[ऀ-ൿ]+')
+_NUM = re.compile(r'\d+')
 
 
 def _is_subseq(short, long):
@@ -94,16 +107,94 @@ def mine_legal(names_canon, countries, min_share=config.LEGAL_MIN_SHARE):
     return sorted(t for t in legal if not t.isdigit() and len(t) <= 12)
 
 
+def mine_legal_strict(names_canon, min_share=config.LEGAL_MIN_SHARE):
+    """One country's unambiguous legal forms: frequent final tokens that are final in >= LEGAL_MIN_LAST
+    of the names containing them and follow >= LEGAL_MIN_PREDECESSORS different words."""
+    last, anywhere, pred = Counter(), Counter(), defaultdict(set)
+    for toks in (n.split() for n in names_canon):
+        if toks:
+            last[toks[-1]] += 1
+            anywhere.update(set(toks))
+            if len(toks) >= 2:
+                pred[toks[-1]].add(toks[-2])
+    n = max(len(names_canon), 1)
+    return sorted(t for t, v in last.items()
+                  if v / n >= min_share and v / anywhere[t] >= config.LEGAL_MIN_LAST
+                  and len(pred[t]) >= config.LEGAL_MIN_PREDECESSORS and not t.isdigit() and len(t) <= 12)
+
+
+def mine_abbreviations_unlabelled(split, country):
+    """Abbreviation map for one country from near-certain S1/satellite pairs (module docstring, 4)
+    -> ({short: long}, number of pseudo pairs)."""
+    out = config.split_dir(split)
+
+    def frame(name):
+        """Squashed name, first house number and canonical address of every record of `country` in one raw parquet."""
+        t = pq.read_table(out / name, columns=['business_name', 'business_address', 'country'],
+                          filters=[('country', '=', country)])
+        addr = [canon(a) for a in t['business_address'].to_pylist()]
+        first = [_NUM.search(a) for a in addr]
+        return pd.DataFrame({'sq': [canon(n).replace(' ', '') for n in t['business_name'].to_pylist()],
+                             'n0': [(m.group().lstrip('0') or '0') if m else '' for m in first], 'addr': addr})
+
+    a, b = frame('s1_raw.parquet'), frame('s23_raw.parquet')
+    a, b = a[(a.sq.str.len() >= 8) & (a.n0 != '')], b[(b.sq.str.len() >= 8) & (b.n0 != '')]
+    a = a[~a.duplicated(['sq', 'n0'], keep=False)]
+    pairs = a.merge(b, on=['sq', 'n0'], suffixes=('_a', '_b'))
+    mined = mine_abbreviations(zip(pairs.addr_a, pairs.addr_b), config.DICT_MIN_COUNT)
+    vocab = Counter(t for x in a.addr for t in set(x.split()))
+    return {k: v for k, v in mined.items() if vocab[v] >= config.DICT_MIN_COUNT}, len(pairs)
+
+
+def build_abbr_extra(split):
+    """Mine and store the unlabelled abbreviation maps of every S1 country absent from train."""
+    out = config.split_dir(split)
+    seen = set(pq.read_table(config.WORK_DIR / 'train' / 's1_raw.parquet', columns=['country'])['country']
+               .unique().to_pylist())
+    countries = set(pq.read_table(out / 's1_raw.parquet', columns=['country'])['country'].unique().to_pylist())
+    extra = {}
+    for c in sorted(countries - seen):
+        extra[c], n = mine_abbreviations_unlabelled(split, c)
+        print(f'[s1] {split}/{c}: {len(extra[c])} abbreviations mined without labels from {n:,} near-certain '
+              f'pairs, e.g. {list(extra[c].items())[:8]}')
+    (out / 'abbr_extra.json').write_text(json.dumps(extra, indent=0))
+    return extra
+
+
+def _read_legal(path):
+    """legal.json as {country: set}; the older flat-list format means one set for every country ('*')."""
+    raw = json.loads(path.read_text())
+    return {'*': set(raw)} if isinstance(raw, list) else {c: set(v) for c, v in raw.items()}
+
+
+def legal_for(legal, country):
+    """Suffix set of one country from a _read_legal dict."""
+    return legal.get(country, legal.get('*', set()))
+
+
 def build(split):
-    """Mine the train-only maps (train split) and the per-split legal suffix set."""
+    """Mine the train-only maps (train split) and the per-split, per-country legal suffix sets."""
     out = config.split_dir(split)
     s1 = pq.read_table(out / 's1_raw.parquet', columns=['business_name', 'country'])
     names = [canon(n) for n in s1['business_name'].to_pylist()]
-    legal = mine_legal(names, s1['country'].to_pylist())
+    countries = s1['country'].to_pylist()
+    if split == 'train':
+        union = mine_legal(names, countries)             # one set for all train countries, as trained on
+        legal = {c: union for c in sorted(set(countries))}
+    else:
+        train = _read_legal(config.WORK_DIR / 'train' / 'legal.json')
+        seen = set(pq.read_table(config.WORK_DIR / 'train' / 's1_raw.parquet', columns=['country'])['country']
+                   .unique().to_pylist())
+        legal = {}
+        for c in sorted(set(countries)):
+            legal[c] = (sorted(legal_for(train, c)) if c in seen else
+                        mine_legal_strict([n for n, k in zip(names, countries) if k == c]))
     (out / 'legal.json').write_text(json.dumps(legal))
-    print(f'[s1] {split}: {len(legal)} legal/generic suffix tokens, e.g. {legal[:12]}')
+    for c, toks in legal.items():
+        print(f'[s1] {split}/{c}: {len(toks)} legal/generic suffix tokens, e.g. {toks[:12]}')
 
     if split != 'train':
+        build_abbr_extra(split)
         return
     gt = pq.read_table(out / 'gt_pairs.parquet').to_pandas()
     gt = gt.sample(min(len(gt), config.DICT_SAMPLE_PAIRS), random_state=config.SEED)
@@ -123,7 +214,13 @@ def build(split):
 
 
 def load(split):
-    """-> (abbr, translit, legal) for a split; the maps always come from train."""
+    """-> (abbr, translit, {country: legal set}) for a split. The maps come from train; `abbr` is
+    {country: map}: '*' is the train map, and a country unseen in train gets ONLY its own unlabelled
+    map (mined here on first use if abbr_extra.json does not exist yet). The train map is US/India
+    specific: applied to France it read the stopwords 'de la' as 'delaware louisiana'."""
     maps = json.loads((config.WORK_DIR / 'train' / 'maps.json').read_text())
-    legal = json.loads((config.WORK_DIR / split / 'legal.json').read_text())
-    return maps['abbr'], maps['translit'], set(legal)
+    abbr = {'*': maps['abbr']}
+    if split != 'train':
+        path = config.WORK_DIR / split / 'abbr_extra.json'
+        abbr.update(json.loads(path.read_text()) if path.exists() else build_abbr_extra(split))
+    return abbr, maps['translit'], _read_legal(config.WORK_DIR / split / 'legal.json')

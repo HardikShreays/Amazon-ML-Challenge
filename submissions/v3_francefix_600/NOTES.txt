@@ -1,0 +1,8 @@
+﻿v3 — France suffix fix + partition + address-missing threshold (analysis/run_v3.ps1, finished 27 Sep 03:27)
+pipeline: test re-run from dictionaries in work_v3; France suffix set = sarl sas sasu eurl sa sci ei;
+          US/India keep the train suffix set
+model   : pass-1 fold models, first 600 trees each, averaged; no pass 2
+decision: mode=partition, tau=0.75, tau_noaddr=0.8 (train TUNE macro F0.5 0.9556)
+command : ER_WORK_DIR=work_v3 ER_OUTPUT_DIR=submissions/v3_francefix_600, stages s1_dictionaries..s3_features
+          then python -m src.fast_submit --trees 600
+leaderboard score: <fill in>
